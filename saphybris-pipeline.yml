@@ -1,0 +1,164 @@
+trigger: none   # manual trigger (recommended for parameterized runs)
+
+parameters:
+- name: branchName
+  displayName: "Git Branch"
+  type: string
+  default: main
+
+- name: environmentCode
+  displayName: "Target Environment"
+  type: string
+  default: dev
+  values:
+    - dev
+
+- name: pollInterval
+  displayName: "Polling interval (seconds)"
+  type: number
+  default: 30
+
+- name: maxWaitMinutes
+  displayName: "Max wait time (minutes)"
+  type: number
+  default: 30
+
+pool:
+  name: Default   # self-hosted agent pool
+
+variables:
+- group: sap-cc-dev
+
+stages:
+- stage: Build_and_Deploy
+  displayName: "Build & Deploy to ${{ parameters.environmentCode }}"
+  jobs:
+  - job: sap_cc
+    displayName: "SAP Commerce Cloud"
+    timeoutInMinutes: ${{ parameters.maxWaitMinutes }}
+    steps:
+
+    # ---------------------------
+    # Trigger Build
+    # ---------------------------
+    - script: |
+        echo "Triggering SAP Commerce Cloud build"
+        echo "Branch      : ${{ parameters.branchName }}"
+        echo "Environment : ${{ parameters.environmentCode }}"
+
+        response=$(curl -s -X POST \
+          "$SAP_CC_BASE_URL/subscriptions/$SAP_CC_SUBSCRIPTION_CODE/builds" \
+          -H "Authorization: Bearer $SAP_CC_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{
+                \"branch\": \"${{ parameters.branchName }}\"
+              }")
+
+        echo "Build API response:"
+        echo "$response"
+
+        buildCode=$(echo "$response" | jq -r '.code')
+
+        if [ -z "$buildCode" ] || [ "$buildCode" = "null" ]; then
+          echo "❌ Failed to extract buildCode"
+          exit 1
+        fi
+
+        echo "##vso[task.setvariable variable=BUILD_CODE]$buildCode"
+        echo "Build Code: $buildCode"
+      displayName: "Trigger Build"
+
+    # ---------------------------
+    # Poll Build Status
+    # ---------------------------
+    - script: |
+        echo "Polling build status..."
+
+        maxLoops=$(( (${{ parameters.maxWaitMinutes }} * 60) / ${{ parameters.pollInterval }} ))
+
+        for ((i=1; i<=maxLoops; i++)); do
+          status=$(curl -s \
+            "$SAP_CC_BASE_URL/subscriptions/$SAP_CC_SUBSCRIPTION_CODE/builds/$BUILD_CODE" \
+            -H "Authorization: Bearer $SAP_CC_API_TOKEN" \
+            | jq -r '.status')
+
+          echo "[$i/$maxLoops] Build status: $status"
+
+          if [ "$status" = "SUCCESS" ]; then
+            echo "✅ Build completed successfully"
+            exit 0
+          fi
+
+          if [ "$status" = "FAILURE" ]; then
+            echo "❌ Build failed"
+            exit 1
+          fi
+
+          sleep ${{ parameters.pollInterval }}
+        done
+
+        echo "❌ Build timed out"
+        exit 1
+      displayName: "Wait for Build"
+
+    # ---------------------------
+    # Trigger Deployment
+    # ---------------------------
+    - script: |
+        echo "Triggering deployment to ${{ parameters.environmentCode }}"
+
+        response=$(curl -s -X POST \
+          "$SAP_CC_BASE_URL/subscriptions/$SAP_CC_SUBSCRIPTION_CODE/deployments" \
+          -H "Authorization: Bearer $SAP_CC_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{
+                \"buildCode\": \"$BUILD_CODE\",
+                \"environmentCode\": \"${{ parameters.environmentCode }}\"
+              }")
+
+        echo "Deployment API response:"
+        echo "$response"
+
+        deployCode=$(echo "$response" | jq -r '.code')
+
+        if [ -z "$deployCode" ] || [ "$deployCode" = "null" ]; then
+          echo "❌ Failed to extract deployCode"
+          exit 1
+        fi
+
+        echo "##vso[task.setvariable variable=DEPLOY_CODE]$deployCode"
+        echo "Deployment Code: $deployCode"
+      displayName: "Trigger Deployment"
+
+    # ---------------------------
+    # Poll Deployment Status
+    # ---------------------------
+    - script: |
+        echo "Polling deployment status..."
+
+        maxLoops=$(( (${{ parameters.maxWaitMinutes }} * 60) / ${{ parameters.pollInterval }} ))
+
+        for ((i=1; i<=maxLoops; i++)); do
+          status=$(curl -s \
+            "$SAP_CC_BASE_URL/subscriptions/$SAP_CC_SUBSCRIPTION_CODE/deployments/$DEPLOY_CODE" \
+            -H "Authorization: Bearer $SAP_CC_API_TOKEN" \
+            | jq -r '.status')
+
+          echo "[$i/$maxLoops] Deployment status: $status"
+
+          if [ "$status" = "DEPLOYED" ]; then
+            echo "✅ Deployment successful"
+            exit 0
+          fi
+
+          if [ "$status" = "FAILED" ]; then
+            echo "❌ Deployment failed"
+            exit 1
+          fi
+
+          sleep ${{ parameters.pollInterval }}
+        done
+
+        echo "❌ Deployment timed out"
+        exit 1
+      displayName: "Wait for Deployment"
