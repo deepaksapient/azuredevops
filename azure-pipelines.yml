@@ -2,7 +2,7 @@ trigger:
 - main
 
 pool:
-  name: cicd-agent
+  name: Default
 
 steps:
 - script: echo Hello, world!
